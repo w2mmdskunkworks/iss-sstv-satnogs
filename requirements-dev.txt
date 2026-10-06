@@ -1,0 +1,5 @@
+-r requirements.txt
+pysstv>=0.5        # independent SSTV encoder for the simulator
+PyWavelets>=1.5    # eval_stack.py cleanup comparison
+opencv-python-headless>=4.8   # eval_stack.py NL-means comparison
+# the simulator's OGG round trip also needs the ffmpeg binary (apt install ffmpeg)

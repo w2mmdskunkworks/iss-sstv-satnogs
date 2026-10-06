@@ -1,0 +1,12 @@
+venv/
+__pycache__/
+*.pyc
+sstv_event/
+sstv_out/
+*.ogg
+*.wav
+*.raw
+dev/*.log
+dev/*.json
+dev/*.pkl
+dev/docx/
