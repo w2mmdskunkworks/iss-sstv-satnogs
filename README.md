@@ -164,6 +164,8 @@ after any change to `sstvdec/`. Calibration and evaluation harnesses:
 * `dev/calib.py`: the per-mode filter-blend thresholds.
 * `dev/eval_stack.py`: the merge and cleanup strategies.
 * `dev/eval_merge2.py`: the merge-weighting variants.
+* `dev/audit_grouping.py`: after a real run, checks that every decode was
+  grouped with the slide it best matches.
 
 `dev/test_photo.png` and `dev/test_text.png` are slides received during the
 event, used as simulator test images.

@@ -189,7 +189,15 @@ def fit_period(utc, min_s=20.0, max_s=1200.0, tol=0.02):
     return float(np.median(g[np.abs(g / c - 1) < tol]))
 
 
+MAX_RUN_GAP_S = 4 * 3600   # never assume the schedule ran on unobserved for longer
+
+
 def _runs(utc, period, tol=0.03):
+    """Split transmissions into runs of one continuous schedule. A new run
+    starts when the grid phase jumps (onboard restart) OR after a gap longer
+    than MAX_RUN_GAP_S: over a night with no passes the phase can line up by
+    chance (Oct 6 2026: 340.004 periods) while the deck itself was paused or
+    restarted, which mislabelled every slide of the next pass by one."""
     order = np.argsort(utc)
     run = np.zeros(len(utc), int)
     slot = np.zeros(len(utc), int)
@@ -197,7 +205,7 @@ def _runs(utc, period, tol=0.03):
     for i in order:
         if start is not None:
             n_prev = (utc[i] - utc[prev]) / period
-            if abs(n_prev - round(n_prev)) > tol:
+            if abs(n_prev - round(n_prev)) > tol or utc[i] - utc[prev] > MAX_RUN_GAP_S:
                 start = None
         if start is None:
             rid += 1
@@ -208,7 +216,10 @@ def _runs(utc, period, tol=0.03):
     return run, slot
 
 
-def group_by_schedule(items, n_slides, period, link_thresh=0.55):
+LINK_MARGIN = 0.10     # best offset must beat the runner-up by this much
+
+
+def group_by_schedule(items, n_slides, period, link_thresh=0.5):
     utc = np.array([it["utc"] for it in items])
     run, slot = _runs(utc, period)
     key = {}
@@ -219,32 +230,82 @@ def group_by_schedule(items, n_slides, period, link_thresh=0.55):
     W = [row_weights(it) for it in items]
     subs = list(key)
     feats = {k: _cluster_feat(R, W, [(i, 0, 0) for i in key[k]]) for k in subs}
-    ev = {}
-    for a in range(len(subs)):
-        for b in range(a + 1, len(subs)):
-            ka, kb = subs[a], subs[b]
-            if ka[0] == kb[0]:
-                continue
-            s = similarity(*feats[ka], *feats[kb])[0]
-            ev.setdefault((ka[0], kb[0], (ka[1] - kb[1]) % n_slides), []).append(s)
     runs = sorted(set(run))
-    parent = {r: r for r in runs}
-    off = {r: 0 for r in runs}
+    run_q = {r: sum(quality(items[i]) for i in range(len(items)) if run[i] == r) for r in runs}
+
+    # Incremental linking. Start from the strongest run; repeatedly link the
+    # unlinked run whose best cyclic offset most clearly beats its runner-up,
+    # scoring each offset against the MERGED slots of everything linked so
+    # far (much cleaner than single noisy copies). Small runs (1-2 images)
+    # can coincidentally resemble the wrong slide: requiring a clear margin
+    # leaves them unlinked rather than guessing (Oct 6 2026: a 1-slot-off
+    # link put Sophie Adenot copies into the soldering slide).
+    off = {}
+    acc, accw = {}, {}
+
+    def add_run(r, o, sign=1):
+        if sign > 0:
+            off[r] = o
+        for (rr, sl) in key:
+            if rr != r:
+                continue
+            lab = (sl + o) % n_slides
+            f, w = feats[(rr, sl)]
+            acc[lab] = acc.get(lab, 0) + sign * f * w[:, None]
+            accw[lab] = accw.get(lab, 0) + sign * w
+        if sign < 0:
+            del off[r]
+
+    def offset_scores(r):
+        slots = [(sl, feats[(rr, sl)]) for (rr, sl) in key if rr == r]
+        scores = []
+        for o in range(n_slides):
+            vals = []
+            for sl, (f, w) in slots:
+                lab = (sl + o) % n_slides
+                if lab in acc and np.sum(accw[lab]) > 1e-9:
+                    gf = acc[lab] / np.maximum(accw[lab][:, None], 1e-12)
+                    v = similarity(gf, accw[lab], f, w)[0]
+                    if v > -1:
+                        vals.append(v)
+            scores.append(np.mean(vals) if vals else -1.0)
+        order = np.argsort(scores)[::-1]
+        return int(order[0]), scores[order[0]], scores[order[0]] - scores[order[1]]
+
+    anchor = max(runs, key=lambda r: run_q[r])
+    add_run(anchor, 0)
+    while True:
+        best = None
+        for r in runs:
+            if r in off:
+                continue
+            o, top, margin = offset_scores(r)
+            if top >= link_thresh and margin >= LINK_MARGIN:
+                if best is None or margin > best[0]:
+                    best = (margin, r, o)
+        if best is None:
+            break
+        add_run(best[1], best[2])
+
+    # Refinement: a run linked early was scored against a deck that later
+    # became much cleaner. Re-score every linked run against all the others
+    # (leave-one-out) and move it if another offset now clearly wins.
+    for _ in range(5):
+        moved = False
+        for r in [r for r in runs if r in off and r != anchor]:
+            o_old = off[r]
+            add_run(r, o_old, -1)
+            o, top, margin = offset_scores(r)
+            if o != o_old and top >= link_thresh and margin >= LINK_MARGIN:
+                add_run(r, o)
+                moved = True
+            else:
+                add_run(r, o_old)
+        if not moved:
+            break
 
     def find(r):
-        if parent[r] == r:
-            return r, 0
-        root, o = find(parent[r])
-        return root, (o + off[r]) % n_slides
-
-    for best, ra, rb, o in sorted(((max(v), ra, rb, o) for (ra, rb, o), v in ev.items()),
-                                  reverse=True):
-        if best < link_thresh:
-            break
-        (root_a, oa), (root_b, ob) = find(ra), find(rb)
-        if root_a != root_b:
-            parent[root_b] = root_a
-            off[root_b] = (o + oa - ob) % n_slides
+        return (0, off[r]) if r in off else (r + 1, 0)
 
     label = {}
     for i in range(len(items)):
@@ -260,8 +321,8 @@ def group_by_schedule(items, n_slides, period, link_thresh=0.55):
             cl.append((j, dy, dx) if r > 0.3 else (j, 0, 0))
         clusters.append(cl)
     groups = len({find(r)[0] for r in runs})
-    if groups > 1:                       # unlinked runs: try picture joins
-        clusters = join_clusters(items, clusters, 0.5, R, W)
+    if groups > 1:                       # unlinked runs: strict picture joins
+        clusters = join_clusters(items, clusters, 0.65, R, W)
     return clusters, {"period": period, "runs": len(runs), "linked_groups": groups}
 
 
